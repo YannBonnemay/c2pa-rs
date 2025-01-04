@@ -15,6 +15,7 @@ use std::{
     collections::HashMap,
     fs::File,
     io::{BufReader, Cursor, Write},
+    ops::Range,
     path::*,
 };
 
@@ -48,6 +49,10 @@ const XMP_SIGNATURE_BUFFER_SIZE: usize = XMP_SIGNATURE.len() + 1; // skip null o
 const MAX_JPEG_MARKER_SIZE: usize = 64000; // technically it's 64K but a bit smaller is fine
 
 const C2PA_MARKER: [u8; 4] = [0x63, 0x32, 0x70, 0x61];
+
+const OFFSET_C2PA_MARKER: Range<usize> = 24_usize..28;
+const OFFSET_CI: Range<usize> = 0_usize..2_usize; // JP
+const OFFSET_EN: Range<usize> = 2_usize..4_usize; // Box Instance Number
 
 fn vec_compare(va: &[u8], vb: &[u8]) -> bool {
     (va.len() == vb.len()) &&  // zip stops at the shortest
@@ -345,108 +350,7 @@ impl CAIWriter for JpegIO {
         &self,
         input_stream: &mut dyn CAIRead,
     ) -> Result<Vec<HashObjectPositions>> {
-        let mut cai_en: Vec<u8> = Vec::new();
-        let mut cai_seg_cnt: u32 = 0;
-
-        let mut positions: Vec<HashObjectPositions> = Vec::new();
-        let mut curr_offset = 2; // start after JPEG marker
-
-        let output_vec: Vec<u8> = Vec::new();
-        let mut output_stream = Cursor::new(output_vec);
-        // make sure the file has the required segments so we can generate all the required offsets
-        add_required_segs_to_stream(input_stream, &mut output_stream)?;
-
-        let buf: Vec<u8> = output_stream.into_inner();
-
-        let dimg = DynImage::from_bytes(buf.into())
-            .map_err(|e| Error::OtherError(Box::new(e)))?
-            .ok_or(Error::UnsupportedType)?;
-
-        match dimg {
-            DynImage::Jpeg(jpeg) => {
-                for seg in jpeg.segments() {
-                    match seg.marker() {
-                        markers::APP11 => {
-                            // JUMBF marker
-                            let raw_bytes = seg.contents();
-
-                            if raw_bytes.len() > 16 {
-                                // we need at least 16 bytes in each segment for CAI
-                                let mut raw_vec = raw_bytes.to_vec();
-                                let _ci = raw_vec.as_mut_slice()[0..2].to_vec();
-                                let en = raw_vec.as_mut_slice()[2..4].to_vec();
-
-                                let is_cai_continuation = vec_compare(&cai_en, &en);
-
-                                if cai_seg_cnt > 0 && is_cai_continuation {
-                                    cai_seg_cnt += 1;
-
-                                    let v = HashObjectPositions {
-                                        offset: curr_offset,
-                                        length: seg.len_with_entropy(),
-                                        htype: HashBlockObjectType::Cai,
-                                    };
-                                    positions.push(v);
-                                } else {
-                                    // check if this is a CAI JUMBF block
-                                    let jumb_type = raw_vec
-                                        .get(24..28)
-                                        .ok_or(Error::InvalidAsset(
-                                            "Invalid JPEG CAI JUMBF block".to_string(),
-                                        ))?
-                                        .to_vec();
-                                    let is_cai = vec_compare(&C2PA_MARKER, &jumb_type);
-                                    if is_cai {
-                                        cai_seg_cnt = 1;
-                                        cai_en.clone_from(&en); // store the identifier
-
-                                        let v = HashObjectPositions {
-                                            offset: curr_offset,
-                                            length: seg.len_with_entropy(),
-                                            htype: HashBlockObjectType::Cai,
-                                        };
-
-                                        positions.push(v);
-                                    } else {
-                                        // save other for completeness sake
-                                        let v = HashObjectPositions {
-                                            offset: curr_offset,
-                                            length: seg.len_with_entropy(),
-                                            htype: HashBlockObjectType::Other,
-                                        };
-                                        positions.push(v);
-                                    }
-                                }
-                            }
-                        }
-                        markers::APP1 => {
-                            // XMP marker or EXIF or Extra XMP
-                            let v = HashObjectPositions {
-                                offset: curr_offset,
-                                length: seg.len_with_entropy(),
-                                htype: HashBlockObjectType::Xmp,
-                            };
-                            // todo: pick the app1 that is the xmp (not crucial as it gets hashed either way)
-                            positions.push(v);
-                        }
-                        _ => {
-                            // save other for completeness sake
-                            let v = HashObjectPositions {
-                                offset: curr_offset,
-                                length: seg.len_with_entropy(),
-                                htype: HashBlockObjectType::Other,
-                            };
-
-                            positions.push(v);
-                        }
-                    }
-                    curr_offset += seg.len_with_entropy();
-                }
-            }
-            _ => return Err(Error::InvalidAsset("Unknown image format".to_owned())),
-        }
-
-        Ok(positions)
+        get_object_locations_from_stream(input_stream)
     }
 
     fn remove_cai_store_from_stream(
@@ -1117,6 +1021,74 @@ impl ComposedManifestRef for JpegIO {
 
         Ok(out_stream.into_inner())
     }
+}
+
+fn get_object_locations_from_stream(
+    input_stream: &mut dyn CAIRead,
+) -> Result<Vec<HashObjectPositions>> {
+    let mut cai_en_current: Vec<u8> = Vec::new();
+    let mut positions: Vec<HashObjectPositions> = Vec::new();
+    let mut curr_offset = OFFSET_CI.end; // start after JPEG marker
+    let output_vec: Vec<u8> = Vec::new();
+    let mut output_stream = Cursor::new(output_vec);
+
+    // make sure the file has the required segments so we can generate all the required offsets
+    add_required_segs_to_stream(input_stream, &mut output_stream)?;
+
+    let buf: Vec<u8> = output_stream.into_inner();
+    let dimg = DynImage::from_bytes(buf.into())
+        .map_err(|e| Error::OtherError(Box::new(e)))?
+        .ok_or(Error::UnsupportedType)?;
+
+    let DynImage::Jpeg(jpeg) = dimg else {
+        return Err(Error::InvalidAsset(r#"Unknown image format"#.to_owned()));
+    };
+
+    for seg in jpeg.segments() {
+        let htype;
+
+        match seg.marker() {
+            markers::APP11 => {
+                // JUMBF marker
+                let raw_bytes = seg.contents();
+
+                // we need at least 28 bytes to process CAI JUMBF block
+                if raw_bytes.len() < OFFSET_C2PA_MARKER.end {
+                    // !!plonk!!
+                    continue;
+                }
+
+                let is_cai_first = C2PA_MARKER.to_ascii_lowercase()
+                    == raw_bytes[OFFSET_C2PA_MARKER].to_ascii_lowercase();
+
+                let cai_en = raw_bytes[OFFSET_EN].to_vec();
+                let is_cai_continuation = vec_compare(&cai_en_current, &cai_en);
+
+                if is_cai_first || is_cai_continuation {
+                    htype = HashBlockObjectType::Cai;
+                    cai_en_current.clone_from(&cai_en); // store the identifier
+                } else {
+                    // save other for completeness sake
+                    htype = HashBlockObjectType::Other;
+                }
+            }
+            markers::APP1 => {
+                // XMP marker or EXIF or Extra XMP
+                htype = HashBlockObjectType::Xmp;
+            }
+            _ => {
+                // save other for completeness sake
+                htype = HashBlockObjectType::Other;
+            }
+        }
+        positions.push(HashObjectPositions {
+            offset: curr_offset,
+            length: seg.len_with_entropy(),
+            htype,
+        });
+        curr_offset += seg.len_with_entropy();
+    }
+    Ok(positions)
 }
 
 #[cfg(test)]
